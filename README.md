@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/bright8192-esxi-mcp-server-badge.png)](https://mseep.ai/app/bright8192-esxi-mcp-server)
+
 # ESXi MCP Server
 
 A VMware ESXi/vCenter management server based on MCP (Model Control Protocol), providing simple REST API interfaces for virtual machine management.
