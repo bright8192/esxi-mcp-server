@@ -1,4 +1,5 @@
 # ESXi MCP Server
+[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/bright8192/esxi-mcp-server)](https://archestra.ai/mcp-catalog/bright8192__esxi-mcp-server)
 
 A VMware ESXi/vCenter management server based on MCP (Model Control Protocol), providing simple REST API interfaces for virtual machine management.
 
