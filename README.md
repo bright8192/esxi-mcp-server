@@ -1,6 +1,6 @@
 # ESXi MCP Server
 
-A VMware ESXi/vCenter management server based on MCP (Model Control Protocol), providing simple REST API interfaces for virtual machine management.
+A VMware ESXi/vCenter management server based on MCP (Model Context Protocol), providing simple REST API interfaces for virtual machine management.
 
 ## Features
 
