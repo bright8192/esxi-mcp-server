@@ -33,14 +33,14 @@ A VMware ESXi/vCenter management server based on MCP (Model Control Protocol), p
 - pyVmomi
 - PyYAML
 - uvicorn
-- mcp-core (Machine Control Protocol core library)
+- mcp (Machine Control Protocol core library)
 
 ## Quick Start
 
 1. Install dependencies:
 
 ```bash
-pip install pyvmomi pyyaml uvicorn mcp-core
+pip install pyvmomi pyyaml uvicorn mcp
 ```
 
 2. Create configuration file `config.yaml`:
