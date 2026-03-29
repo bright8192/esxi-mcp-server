@@ -2,6 +2,10 @@
 
 A VMware ESXi/vCenter management server based on MCP (Model Control Protocol), providing simple REST API interfaces for virtual machine management.
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/bright8192-esxi-mcp-server).
+
 ## Features
 
 - Support for ESXi and vCenter Server connections
