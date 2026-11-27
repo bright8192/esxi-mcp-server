@@ -3,6 +3,7 @@ import json
 import logging
 import ssl
 import argparse
+import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
@@ -288,14 +289,34 @@ class VMwareManager:
         vm_folder = template_vm.parent  # Place the new VM in the same folder as the template
         if not isinstance(vm_folder, vim.Folder):
             vm_folder = self.datacenter_obj.vmFolder
-        # Use the resource pool of the host/cluster where the template is located
-        resource_pool = template_vm.resourcePool or self.resource_pool
-        relocate_spec = vim.vm.RelocateSpec(pool=resource_pool, datastore=self.datastore_obj)
+        # Keep the template's own disk datastore (thin clone); fall back to config.
+        _ds = None
+        for _d in template_vm.config.hardware.device:
+            if isinstance(_d, vim.vm.device.VirtualDisk) and getattr(_d.backing, "datastore", None):
+                _ds = _d.backing.datastore
+                break
+        if _ds is None:
+            _ds = self.datastore_obj
+        # Pin a host that has ALL the template's networks AND the datastore, so the
+        # clone is not placed on an incompatible host ("No host is compatible ...").
+        _src_nets = set(n.name for n in template_vm.network)
+        def _compatible(h):
+            if h.runtime.connectionState != "connected" or h.runtime.inMaintenanceMode:
+                return False
+            return _src_nets.issubset(set(n.name for n in h.network)) and _ds.name in set(x.name for x in h.datastore)
+        _hosts = self.content.viewManager.CreateContainerView(
+            self.content.rootFolder, [vim.HostSystem], True).view
+        _cur = template_vm.runtime.host
+        _host = _cur if (_cur and _compatible(_cur)) else next((h for h in _hosts if _compatible(h)), None)
+        if _host is None:
+            raise Exception(f"No compatible host for networks {sorted(_src_nets)} + datastore {_ds.name}")
+        logging.info(f"Cloning {template_name} -> {new_name} on compatible host {_host.name}")
+        relocate_spec = vim.vm.RelocateSpec(host=_host, pool=_host.parent.resourcePool, datastore=_ds)
         clone_spec = vim.vm.CloneSpec(powerOn=False, template=False, location=relocate_spec)
         try:
             task = template_vm.Clone(folder=vm_folder, name=new_name, spec=clone_spec)
             while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
-                continue
+                time.sleep(2)
             if task.info.state == vim.TaskInfo.State.error:
                 raise task.info.error
         except Exception as e:
@@ -328,13 +349,29 @@ class VMwareManager:
             raise Exception(f"Virtual machine {name} not found")
         if vm.runtime.powerState == vim.VirtualMachine.PowerState.poweredOn:
             return f"VM '{name}' is already powered on."
-        task = vm.PowerOnVM_Task()
+        # If the VM's current host can't satisfy its networks + datastores, relocate
+        # the power-on onto a compatible host (avoids "No host is compatible ...").
+        _nets = set(n.name for n in vm.network)
+        _dss = set(d.name for d in vm.datastore)
+        def _compatible(h):
+            if h.runtime.connectionState != "connected" or h.runtime.inMaintenanceMode:
+                return False
+            return _nets.issubset(set(n.name for n in h.network)) and _dss.issubset(set(x.name for x in h.datastore))
+        _cur = vm.runtime.host
+        _host = None
+        if not (_cur and _compatible(_cur)):
+            _hosts = self.content.viewManager.CreateContainerView(
+                self.content.rootFolder, [vim.HostSystem], True).view
+            _host = next((h for h in _hosts if _compatible(h)), None)
+            if _host is None:
+                raise Exception(f"No compatible host for '{name}' (networks {sorted(_nets)})")
+        task = vm.PowerOnVM_Task(host=_host) if _host else vm.PowerOnVM_Task()
         while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
-            continue
+            time.sleep(1)
         if task.info.state == vim.TaskInfo.State.error:
             raise task.info.error
-        logging.info(f"Virtual machine powered on: {name}")
-        return f"VM '{name}' powered on."
+        logging.info(f"Virtual machine powered on: {name}" + (f" on host {_host.name}" if _host else ""))
+        return f"VM '{name}' powered on." + (f" (relocated to {_host.name})" if _host else "")
 
     def power_off_vm(self, name: str) -> str:
         """Power off the specified virtual machine."""
@@ -420,6 +457,204 @@ def _check_auth():
         if not manager.authenticated:
             raise Exception("Unauthorized: API key required.")
 
+# ---- Extended tools (ported from the standalone helper scripts) ----
+def _all_vms():
+    cv = manager.content.viewManager.CreateContainerView(manager.content.rootFolder, [vim.VirtualMachine], True)
+    r = list(cv.view); cv.Destroy(); return r
+
+def _all_hosts():
+    cv = manager.content.viewManager.CreateContainerView(manager.content.rootFolder, [vim.HostSystem], True)
+    r = list(cv.view); cv.Destroy(); return r
+
+def _wait(t):
+    while t.info.state not in (vim.TaskInfo.State.success, vim.TaskInfo.State.error):
+        time.sleep(1)
+    if t.info.state == vim.TaskInfo.State.error:
+        raise Exception(getattr(t.info.error, "msg", t.info.error))
+
+def _host_network(host, netname):
+    return next((n for n in host.network if n.name == netname), None)
+
+def tool_find_vm_by_ip(ip: str):
+    _check_auth()
+    hits = []
+    for vm in _all_vms():
+        ips = set(); g = vm.guest
+        if g:
+            if g.ipAddress: ips.add(g.ipAddress)
+            for nic in (g.net or []):
+                for a in (nic.ipAddress or []): ips.add(a)
+        if ip in ips or ip in vm.name:
+            hits.append({"name": vm.name, "power": str(vm.runtime.powerState),
+                         "host": vm.runtime.host.name if vm.runtime.host else None,
+                         "guest_ips": sorted(ips)})
+    return hits or f"No VM found with guest-IP or name matching {ip} (bare-metal or VMware Tools not running won't match)."
+
+def tool_find_vm_by_mac(mac: str):
+    _check_auth()
+    m = mac.lower(); hits = []
+    for vm in _all_vms():
+        for d in vm.config.hardware.device:
+            if isinstance(d, vim.vm.device.VirtualEthernetCard) and d.macAddress and d.macAddress.lower() == m:
+                hits.append({"name": vm.name, "nic_mac": d.macAddress, "source": "config",
+                             "host": vm.runtime.host.name if vm.runtime.host else None})
+        if vm.guest and vm.guest.net:
+            for nic in vm.guest.net:
+                if nic.macAddress and nic.macAddress.lower() == m:
+                    hits.append({"name": vm.name, "mac": nic.macAddress, "source": "guest"})
+    return hits or f"No VM in this vCenter has MAC {mac}."
+
+def tool_vm_details(name: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    cfg, rt, sm = vm.config, vm.runtime, vm.summary
+    disks = []; nics = []
+    for d in cfg.hardware.device:
+        if isinstance(d, vim.vm.device.VirtualDisk):
+            disks.append({"label": d.deviceInfo.label, "gb": round(d.capacityInKB/1024/1024, 1),
+                          "datastore": d.backing.datastore.name if getattr(d.backing, "datastore", None) else None,
+                          "thin": getattr(d.backing, "thinProvisioned", None)})
+        if isinstance(d, vim.vm.device.VirtualEthernetCard):
+            b = d.backing
+            net = getattr(b, "deviceName", None) or getattr(getattr(b, "port", None), "portgroupKey", None)
+            nics.append({"label": d.deviceInfo.label, "mac": d.macAddress, "network": net,
+                         "connected": d.connectable.connected if d.connectable else None})
+    return {"name": vm.name, "power": str(rt.powerState),
+            "guest_os_configured": cfg.guestFullName,
+            "guest_os_running": vm.guest.guestFullName if vm.guest else None,
+            "vcpu": cfg.hardware.numCPU, "cores_per_socket": cfg.hardware.numCoresPerSocket,
+            "memory_mb": cfg.hardware.memoryMB, "memory_gb": round(cfg.hardware.memoryMB/1024, 1),
+            "esxi_host": rt.host.name if rt.host else None, "hw_version": cfg.version, "uuid": cfg.uuid,
+            "tools": vm.guest.toolsRunningStatus if vm.guest else None,
+            "guest_ip": vm.guest.ipAddress if vm.guest else None,
+            "annotation": (cfg.annotation or "").strip()[:300],
+            "disks": disks, "total_disk_gb": round(sum(d["gb"] for d in disks), 1),
+            "committed_gb": round(sm.storage.committed/1024/1024/1024, 1) if sm.storage else None,
+            "nics": nics}
+
+def tool_list_datastores(name: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    host = vm.runtime.host
+    cur = next((d.backing.datastore.name for d in vm.config.hardware.device
+                if isinstance(d, vim.vm.device.VirtualDisk) and getattr(d.backing, "datastore", None)), None)
+    out = []
+    for ds in sorted(host.datastore, key=lambda d: -d.summary.freeSpace):
+        s = ds.summary; cap = s.capacity/1024**3; free = s.freeSpace/1024**3
+        out.append({"name": s.name, "type": s.type, "cap_gb": round(cap), "free_gb": round(free),
+                    "used_pct": round(100*(cap-free)/cap) if cap else 0, "current": s.name == cur})
+    return {"vm": vm.name, "host": host.name, "current_datastore": cur, "datastores": out}
+
+def tool_list_hosts():
+    _check_auth()
+    out = []
+    for h in _all_hosts():
+        hw = h.hardware
+        out.append({"name": h.name, "cluster": h.parent.name if h.parent else None,
+                    "connection": str(h.runtime.connectionState), "maintenance": h.runtime.inMaintenanceMode,
+                    "cpu_cores": hw.cpuInfo.numCpuCores if hw else None,
+                    "mem_gb": round(hw.memorySize/1024**3) if hw else None,
+                    "networks": sorted(n.name for n in h.network),
+                    "datastores": sorted(x.name for x in h.datastore)})
+    return out
+
+def tool_rename_vm(name: str, new_name: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    if vm.name == new_name: return f"VM already named '{new_name}'."
+    _wait(vm.Rename_Task(new_name))
+    return f"Renamed '{name}' -> '{new_name}'."
+
+def tool_resize_vm(name: str, cpu: int, memory_gb: int):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    was_on = vm.runtime.powerState == vim.VirtualMachine.PowerState.poweredOn
+    if was_on:
+        _wait(vm.PowerOffVM_Task())
+        for _ in range(60):
+            if vm.runtime.powerState == vim.VirtualMachine.PowerState.poweredOff: break
+            time.sleep(1)
+    spec = vim.vm.ConfigSpec(numCPUs=int(cpu), numCoresPerSocket=1, memoryMB=int(memory_gb)*1024)
+    _wait(vm.ReconfigVM_Task(spec))
+    msg = f"Resized '{name}' -> {cpu} vCPU / {memory_gb} GB."
+    if was_on:
+        try: msg += " " + manager.power_on_vm(name)
+        except Exception as e: msg += f" (reconfig ok, power-on failed: {e})"
+    return msg
+
+def tool_grow_disk(name: str, new_size_gb: int):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    disk = next((d for d in vm.config.hardware.device if isinstance(d, vim.vm.device.VirtualDisk)), None)
+    if not disk: raise Exception("no virtual disk found")
+    cur = disk.capacityInKB/1024/1024; newkb = int(new_size_gb)*1024*1024
+    if newkb <= disk.capacityInKB:
+        raise Exception(f"new size {new_size_gb}GB not larger than current {cur:.0f}GB")
+    disk.capacityInKB = newkb
+    ds = vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.edit, device=disk)
+    _wait(vm.ReconfigVM_Task(vim.vm.ConfigSpec(deviceChange=[ds])))
+    return f"Grew '{disk.deviceInfo.label}' {cur:.0f} GB -> {new_size_gb} GB (now extend the filesystem inside the guest)."
+
+def _nic_backing(net, netname):
+    if isinstance(net, vim.dvs.DistributedVirtualPortgroup):
+        conn = vim.dvs.PortConnection(portgroupKey=net.key, switchUuid=net.config.distributedVirtualSwitch.uuid)
+        return vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo(port=conn)
+    return vim.vm.device.VirtualEthernetCard.NetworkBackingInfo(deviceName=netname, network=net)
+
+def tool_add_nic(name: str, network: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    host = vm.runtime.host
+    net = _host_network(host, network)
+    if not net: raise Exception(f"network '{network}' not found on host {host.name}")
+    nic = vim.vm.device.VirtualVmxnet3()
+    nic.backing = _nic_backing(net, network)
+    nic.connectable = vim.vm.device.VirtualDevice.ConnectInfo(startConnected=True, connected=True, allowGuestControl=True)
+    spec = vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.add, device=nic)
+    _wait(vm.ReconfigVM_Task(vim.vm.ConfigSpec(deviceChange=[spec])))
+    return f"Added vmxnet3 NIC on '{network}' to '{name}'."
+
+def tool_set_vm_network(name: str, network: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    host = vm.runtime.host
+    net = _host_network(host, network)
+    if not net: raise Exception(f"network '{network}' not found on host {host.name}")
+    spec = vim.vm.ConfigSpec(); changed = []
+    for d in vm.config.hardware.device:
+        if isinstance(d, vim.vm.device.VirtualEthernetCard):
+            d.backing = _nic_backing(net, network)
+            d.connectable = vim.vm.device.VirtualDevice.ConnectInfo(connected=True, startConnected=True, allowGuestControl=True)
+            spec.deviceChange.append(vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.edit, device=d))
+            changed.append(f"{d.deviceInfo.label}({d.macAddress})")
+    if not changed: raise Exception("no NIC to repoint")
+    _wait(vm.ReconfigVM_Task(spec))
+    return f"Repointed NIC(s) {', '.join(changed)} of '{name}' -> '{network}'."
+
+def tool_storage_vmotion(name: str):
+    _check_auth()
+    vm = manager.find_vm(name)
+    if not vm: raise Exception(f"VM not found: {name}")
+    ds = next((d.backing.datastore for d in vm.config.hardware.device
+               if isinstance(d, vim.vm.device.VirtualDisk) and getattr(d.backing, "datastore", None)), None)
+    if not ds: raise Exception("no disk datastore found")
+    reloc = vim.vm.RelocateSpec(); reloc.datastore = ds; locs = []
+    for d in vm.config.hardware.device:
+        if isinstance(d, vim.vm.device.VirtualDisk):
+            back = vim.vm.device.VirtualDisk.FlatVer2BackingInfo(); back.thinProvisioned = True; back.diskMode = d.backing.diskMode
+            locs.append(vim.vm.RelocateSpec.DiskLocator(diskId=d.key, datastore=ds, diskBackingInfo=back))
+    reloc.disk = locs
+    _wait(vm.RelocateVM_Task(spec=reloc))
+    return f"Storage vMotion (thin rewrite, same datastore {ds.name}) of '{name}' complete."
+
+
 # Register the above functions as tools and resources for the MCP Server
 # Encapsulate using mcp.types.Tool and mcp.types.Resource
 tools = {
@@ -500,7 +735,18 @@ tools = {
         parameters={},
         handler=lambda params: tool_list_vms(),
         inputSchema={"type": "object", "properties": {}}
-    )
+    ),
+    "findVmByIp": types.Tool(name="findVmByIp", description="Find VM(s) by guest IP (or IP embedded in the VM name)", inputSchema={"type":"object","properties":{"ip":{"type":"string"}},"required":["ip"]}),
+    "findVmByMac": types.Tool(name="findVmByMac", description="Find VM(s) by NIC MAC address", inputSchema={"type":"object","properties":{"mac":{"type":"string"}},"required":["mac"]}),
+    "vmDetails": types.Tool(name="vmDetails", description="Full details of a VM: power, OS, vCPU/RAM, host, disks, NICs (mac/network), IPs, tools", inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+    "listDatastores": types.Tool(name="listDatastores", description="Datastores available to a VM's host, with capacity/free and the VM's current datastore", inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+    "listHosts": types.Tool(name="listHosts", description="List ESXi hosts with cluster, CPU/mem, networks and datastores (for placement/compatibility)", inputSchema={"type":"object","properties":{}}),
+    "renameVM": types.Tool(name="renameVM", description="Rename a VM", inputSchema={"type":"object","properties":{"name":{"type":"string"},"new_name":{"type":"string"}},"required":["name","new_name"]}),
+    "resizeVM": types.Tool(name="resizeVM", description="Set vCPU and RAM(GB): powers off, reconfigures, powers back on (host-pinned)", inputSchema={"type":"object","properties":{"name":{"type":"string"},"cpu":{"type":"integer"},"memory_gb":{"type":"integer"}},"required":["name","cpu","memory_gb"]}),
+    "growDisk": types.Tool(name="growDisk", description="Grow the VM's first virtual disk to new_size_gb (extend the filesystem in-guest after)", inputSchema={"type":"object","properties":{"name":{"type":"string"},"new_size_gb":{"type":"integer"}},"required":["name","new_size_gb"]}),
+    "addNic": types.Tool(name="addNic", description="Add a vmxnet3 NIC on the given network (portgroup must exist on the VM's host)", inputSchema={"type":"object","properties":{"name":{"type":"string"},"network":{"type":"string"}},"required":["name","network"]}),
+    "setVmNetwork": types.Tool(name="setVmNetwork", description="Repoint the VM's NIC(s) to another portgroup/network on its host", inputSchema={"type":"object","properties":{"name":{"type":"string"},"network":{"type":"string"}},"required":["name","network"]}),
+    "storageVMotion": types.Tool(name="storageVMotion", description="In-place storage vMotion (thin rewrite, same datastore) to reclaim zeroed blocks", inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]})
 }
 resources = {
     "vmStats": types.Resource(
@@ -547,6 +793,17 @@ _TOOL_DISPATCH = {
     "powerOn":      lambda a: tool_power_on(**a),
     "powerOff":     lambda a: tool_power_off(**a),
     "listVMs":      lambda a: tool_list_vms(),
+    "findVmByIp":     lambda a: tool_find_vm_by_ip(**a),
+    "findVmByMac":    lambda a: tool_find_vm_by_mac(**a),
+    "vmDetails":      lambda a: tool_vm_details(**a),
+    "listDatastores": lambda a: tool_list_datastores(**a),
+    "listHosts":      lambda a: tool_list_hosts(),
+    "renameVM":       lambda a: tool_rename_vm(**a),
+    "resizeVM":       lambda a: tool_resize_vm(**a),
+    "growDisk":       lambda a: tool_grow_disk(**a),
+    "addNic":         lambda a: tool_add_nic(**a),
+    "setVmNetwork":   lambda a: tool_set_vm_network(**a),
+    "storageVMotion": lambda a: tool_storage_vmotion(**a),
 }
 
 @mcp_server.call_tool()
