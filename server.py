@@ -531,6 +531,38 @@ mcp_server.capabilities = {
     "resources": {"listChanged": True}
 }
 
+# --- Real MCP handler registration ---
+# The setattr()/capabilities assignment above is a no-op in the real SDK; without
+# @list_tools/@call_tool handlers the client sees 0 tools. Register them here.
+@mcp_server.list_tools()
+async def _handle_list_tools():
+    return [types.Tool(name=t.name, description=t.description, inputSchema=t.inputSchema)
+            for t in tools.values()]
+
+_TOOL_DISPATCH = {
+    "authenticate": lambda a: tool_authenticate(**a),
+    "createVM":     lambda a: tool_create_vm(**a),
+    "cloneVM":      lambda a: tool_clone_vm(**a),
+    "deleteVM":     lambda a: tool_delete_vm(**a),
+    "powerOn":      lambda a: tool_power_on(**a),
+    "powerOff":     lambda a: tool_power_off(**a),
+    "listVMs":      lambda a: tool_list_vms(),
+}
+
+@mcp_server.call_tool()
+async def _handle_call_tool(name, arguments):
+    arguments = arguments or {}
+    fn = _TOOL_DISPATCH.get(name)
+    if fn is None:
+        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+    try:
+        result = fn(arguments)
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
+    if not isinstance(result, str):
+        result = json.dumps(result, default=str, indent=2)
+    return [types.TextContent(type="text", text=result)]
+
 # Maintain a global SSE transport instance for sending events during POST request processing
 active_transport: Optional[SseServerTransport] = None
 
@@ -543,9 +575,9 @@ async def sse_endpoint(scope, receive, send):
     # Verify API key: Retrieve from request headers 'Authorization' or 'X-API-Key'
     headers_dict = {k.lower().decode(): v.decode() for (k, v) in scope.get("headers", [])}
     provided_key = None
-    if b"authorization" in scope["headers"]:
+    if "authorization" in headers_dict:
         provided_key = headers_dict.get("authorization")
-    elif b"x-api-key" in scope["headers"]:
+    elif "x-api-key" in headers_dict:
         provided_key = headers_dict.get("x-api-key")
     if config.api_key and provided_key != f"Bearer {config.api_key}" and provided_key != config.api_key:
         # If the correct API key is not provided, return 401
@@ -555,11 +587,19 @@ async def sse_endpoint(scope, receive, send):
         logging.warning("No valid API key provided, rejecting SSE connection")
         return
 
+    # Bearer key already proved the API key; mark the shared manager authenticated
+    # so tools run without a separate 'authenticate' call.
+    try:
+        manager.authenticated = True
+    except Exception:
+        pass
+
     # Establish SSE transport and connect to the MCP Server
     active_transport = SseServerTransport("/sse/messages")
     logging.info("Established new SSE session")
-    # Send SSE response headers to the client, preparing to start sending events
-    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    # The mcp SDK's connect_sse() sends the ASGI response itself (SSE headers + the
+    # 'endpoint' event via EventSourceResponse). Sending http.response.start here
+    # caused a double-start -> TaskGroup error -> empty stream. Do NOT send it.
     try:
         async with active_transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
             init_opts = mcp_server.create_initialization_options()
@@ -569,53 +609,23 @@ async def sse_endpoint(scope, receive, send):
         logging.error(f"SSE session encountered an error: {e}")
     finally:
         active_transport = None
-    # SSE session ended, send an empty message to indicate completion
-    await send({"type": "http.response.body", "body": b"", "more_body": False})
+    # connect_sse()/EventSourceResponse already completed the ASGI response.
 
 # JSON-RPC message handler (HTTP POST /sse/messages)
 async def messages_endpoint(scope, receive, send):
-    """Handle JSON-RPC requests sent by the client (via POST)."""
+    """Handle JSON-RPC requests sent by the client (via POST /sse/messages)."""
     global active_transport
-    # Read request body data
-    body_bytes = b''
-    more_body = True
-    while more_body:
-        event = await receive()
-        if event["type"] == "http.request":
-            body_bytes += event.get("body", b'')
-            more_body = event.get("more_body", False)
-    # Parse JSON-RPC request
-    try:
-        body_str = body_bytes.decode('utf-8')
-        msg = json.loads(body_str)
-    except Exception as e:
-        logging.error(f"JSON parsing failed: {e}")
-        await send({"type": "http.response.start", "status": 400,
-                    "headers": [(b"content-type", b"text/plain")]})
-        await send({"type": "http.response.body", "body": b"Invalid JSON"})
-        return
-
     # Only accept requests sent through an established SSE transport
     if not active_transport:
         await send({"type": "http.response.start", "status": 400,
                     "headers": [(b"content-type", b"text/plain")]})
         await send({"type": "http.response.body", "body": b"No active session"})
         return
+    # Delegate to the SDK ASGI app: it reads the body, routes by the session_id
+    # query param into the active MCP session, and sends its own HTTP response
+    # (202 Accepted). Do not pre-read the body or send a reply ourselves.
+    await active_transport.handle_post_message(scope, receive, send)
 
-    # Pass the POST request content to active_transport to trigger the corresponding MCP Server operation
-    try:
-        # Handle the POST message through SseServerTransport, which injects the request into the MCP session
-        await active_transport.handle_post(scope, body_bytes)
-        status = 200
-        response_body = b""
-    except Exception as e:
-        logging.error(f"Error handling POST message: {e}")
-        status = 500
-        response_body = str(e).encode('utf-8')
-    # Reply to the client with HTTP status
-    await send({"type": "http.response.start", "status": status,
-                "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": response_body})
 
 # Simple ASGI application routing: dispatch requests to the appropriate handler based on the path and method
 async def app(scope, receive, send):

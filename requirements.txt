@@ -1,5 +1,5 @@
 pyvmomi>=7.0
 pyyaml>=6.0
 uvicorn>=0.15.0
-mcp
+mcp>=1.30,<2  # pinned: 2.x redesigned the Server API (no list_tools/call_tool decorators); breaks this server
 pytest>=7.0.0
