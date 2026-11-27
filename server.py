@@ -4,6 +4,7 @@ import logging
 import ssl
 import argparse
 import time
+import asyncio
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
@@ -313,17 +314,11 @@ class VMwareManager:
         logging.info(f"Cloning {template_name} -> {new_name} on compatible host {_host.name}")
         relocate_spec = vim.vm.RelocateSpec(host=_host, pool=_host.parent.resourcePool, datastore=_ds)
         clone_spec = vim.vm.CloneSpec(powerOn=False, template=False, location=relocate_spec)
-        try:
-            task = template_vm.Clone(folder=vm_folder, name=new_name, spec=clone_spec)
-            while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
-                time.sleep(2)
-            if task.info.state == vim.TaskInfo.State.error:
-                raise task.info.error
-        except Exception as e:
-            logging.error(f"Failed to clone virtual machine: {e}")
-            raise
-        logging.info(f"Cloned virtual machine {template_name} to new VM: {new_name}")
-        return f"VM '{new_name}' cloned from '{template_name}'."
+        task = template_vm.Clone(folder=vm_folder, name=new_name, spec=clone_spec)
+        logging.info(f"Clone submitted: {template_name} -> {new_name} on host {_host.name} (task {task._moId})")
+        return {"status": "submitted", "new_name": new_name, "source": template_name,
+                "host": _host.name, "task_id": task._moId,
+                "note": "Clone runs in vCenter (minutes); the VM appears at once but is NOT ready until taskStatus(task_id) reports state 'success'."}
 
     def delete_vm(self, name: str) -> str:
         """Delete the specified virtual machine."""
@@ -458,6 +453,15 @@ def _check_auth():
             raise Exception("Unauthorized: API key required.")
 
 # ---- Extended tools (ported from the standalone helper scripts) ----
+def tool_task_status(task_id: str):
+    _check_auth()
+    t = vim.Task(task_id, manager.si._stub)
+    i = t.info
+    return {"task_id": task_id, "state": str(i.state), "progress": i.progress,
+            "description": i.descriptionId, "entity": i.entityName,
+            "error": (i.error.msg if i.error else None),
+            "complete_time": str(i.completeTime) if i.completeTime else None}
+
 def _all_vms():
     cv = manager.content.viewManager.CreateContainerView(manager.content.rootFolder, [vim.VirtualMachine], True)
     r = list(cv.view); cv.Destroy(); return r
@@ -651,8 +655,9 @@ def tool_storage_vmotion(name: str):
             back = vim.vm.device.VirtualDisk.FlatVer2BackingInfo(); back.thinProvisioned = True; back.diskMode = d.backing.diskMode
             locs.append(vim.vm.RelocateSpec.DiskLocator(diskId=d.key, datastore=ds, diskBackingInfo=back))
     reloc.disk = locs
-    _wait(vm.RelocateVM_Task(spec=reloc))
-    return f"Storage vMotion (thin rewrite, same datastore {ds.name}) of '{name}' complete."
+    task = vm.RelocateVM_Task(spec=reloc)
+    return {"status": "submitted", "vm": name, "datastore": ds.name, "task_id": task._moId,
+            "note": "Storage vMotion runs in vCenter (minutes). Poll with taskStatus(task_id)."}
 
 
 # Register the above functions as tools and resources for the MCP Server
@@ -684,7 +689,7 @@ tools = {
     ),
     "cloneVM": types.Tool(
         name="cloneVM",
-        description="Clone a virtual machine from a template or existing VM",
+        description="Clone a VM (host-pinned). Returns immediately with a task_id; poll progress with taskStatus.",
         parameters={"template_name": str, "new_name": str},
         handler=lambda params: tool_clone_vm(**params),
         inputSchema={
@@ -746,7 +751,8 @@ tools = {
     "growDisk": types.Tool(name="growDisk", description="Grow the VM's first virtual disk to new_size_gb (extend the filesystem in-guest after)", inputSchema={"type":"object","properties":{"name":{"type":"string"},"new_size_gb":{"type":"integer"}},"required":["name","new_size_gb"]}),
     "addNic": types.Tool(name="addNic", description="Add a vmxnet3 NIC on the given network (portgroup must exist on the VM's host)", inputSchema={"type":"object","properties":{"name":{"type":"string"},"network":{"type":"string"}},"required":["name","network"]}),
     "setVmNetwork": types.Tool(name="setVmNetwork", description="Repoint the VM's NIC(s) to another portgroup/network on its host", inputSchema={"type":"object","properties":{"name":{"type":"string"},"network":{"type":"string"}},"required":["name","network"]}),
-    "storageVMotion": types.Tool(name="storageVMotion", description="In-place storage vMotion (thin rewrite, same datastore) to reclaim zeroed blocks", inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]})
+    "storageVMotion": types.Tool(name="storageVMotion", description="In-place storage vMotion (thin rewrite, same datastore); returns a task_id, poll with taskStatus", inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+    "taskStatus": types.Tool(name="taskStatus", description="Check a long-running vCenter task (clone/storageVMotion) by its task_id: state, progress %, error", inputSchema={"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]})
 }
 resources = {
     "vmStats": types.Resource(
@@ -804,6 +810,7 @@ _TOOL_DISPATCH = {
     "addNic":         lambda a: tool_add_nic(**a),
     "setVmNetwork":   lambda a: tool_set_vm_network(**a),
     "storageVMotion": lambda a: tool_storage_vmotion(**a),
+    "taskStatus":     lambda a: tool_task_status(**a),
 }
 
 @mcp_server.call_tool()
@@ -813,7 +820,8 @@ async def _handle_call_tool(name, arguments):
     if fn is None:
         return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
     try:
-        result = fn(arguments)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, fn, arguments)
     except Exception as e:
         return [types.TextContent(type="text", text=f"Error: {e}")]
     if not isinstance(result, str):
